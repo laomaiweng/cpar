@@ -1,0 +1,122 @@
+diff --git a/hazmat/backends/openssl/backend.py b/hazmat/backends/openssl/backend.py
+index 0a9bc53..9584cfc 100644
+--- a/hazmat/backends/openssl/backend.py
++++ b/hazmat/backends/openssl/backend.py
+@@ -72,7 +72,7 @@ from cryptography.hazmat.primitives.ciphers.algorithms import (
+     AES, ARC4, Blowfish, CAST5, Camellia, ChaCha20, IDEA, SEED, TripleDES
+ )
+ from cryptography.hazmat.primitives.ciphers.modes import (
+-    CBC, CFB, CFB8, CTR, ECB, GCM, OFB, XTS
++    CBC, CFB, CFB8, CTR, ECB, GCM, OFB, XTS, Poly1305
+ )
+ from cryptography.hazmat.primitives.kdf import scrypt
+ from cryptography.hazmat.primitives.serialization import ssh
+@@ -281,6 +281,11 @@ class Backend(object):
+             type(None),
+             GetCipherByName("chacha20")
+         )
++        self.register_cipher_adapter(
++            ChaCha20,
++            Poly1305,
++            GetCipherByName("chacha20-poly1305")
++        )
+         self.register_cipher_adapter(AES, XTS, _get_xts_cipher)
+ 
+     def create_symmetric_encryption_ctx(self, cipher, mode):
+diff --git a/hazmat/backends/openssl/ciphers.py b/hazmat/backends/openssl/ciphers.py
+index 66ac5fd..250688e 100644
+--- a/hazmat/backends/openssl/ciphers.py
++++ b/hazmat/backends/openssl/ciphers.py
+@@ -81,7 +81,7 @@ class _CipherContext(object):
+             ctx, len(cipher.key)
+         )
+         self._backend.openssl_assert(res != 0)
+-        if isinstance(mode, modes.GCM):
++        if isinstance(mode, modes.ModeWithAuthenticationTag):
+             res = self._backend._lib.EVP_CIPHER_CTX_ctrl(
+                 ctx, self._backend._lib.EVP_CTRL_AEAD_SET_IVLEN,
+                 len(iv_nonce), self._backend._ffi.NULL
+@@ -100,7 +100,7 @@ class _CipherContext(object):
+                 not self._backend._lib.CRYPTOGRAPHY_IS_LIBRESSL
+             ):
+                 raise NotImplementedError(
+-                    "delayed passing of GCM tag requires OpenSSL >= 1.0.2."
++                    "delayed passing of AEAD tag requires OpenSSL >= 1.0.2."
+                     " To use this feature please update OpenSSL"
+                 )
+ 
+@@ -146,9 +146,9 @@ class _CipherContext(object):
+         # OpenSSL 1.0.1 on Ubuntu 12.04 (and possibly other distributions)
+         # appears to have a bug where you must make at least one call to update
+         # even if you are only using authenticate_additional_data or the
+-        # GCM tag will be wrong. An (empty) call to update resolves this
++        # AEAD tag will be wrong. An (empty) call to update resolves this
+         # and is harmless for all other versions of OpenSSL.
+-        if isinstance(self._mode, modes.GCM):
++        if isinstance(self._mode, modes.ModeWithAuthenticationTag):
+             self.update(b"")
+ 
+         if (
+@@ -166,7 +166,7 @@ class _CipherContext(object):
+         if res == 0:
+             errors = self._backend._consume_errors()
+ 
+-            if not errors and isinstance(self._mode, modes.GCM):
++            if not errors and isinstance(self._mode, modes.ModeWithAuthenticationTag):
+                 raise InvalidTag
+ 
+             self._backend.openssl_assert(
+@@ -180,14 +180,16 @@ class _CipherContext(object):
+                 "the block length."
+             )
+ 
+-        if (isinstance(self._mode, modes.GCM) and
+-           self._operation == self._ENCRYPT):
++        if (
++            isinstance(self._mode, modes.ModeWithAuthenticationTag) and
++            self._operation == self._ENCRYPT
++        ):
+             tag_buf = self._backend._ffi.new(
+-                "unsigned char[]", self._block_size_bytes
++                "unsigned char[]", self._mode._min_tag_length
+             )
+             res = self._backend._lib.EVP_CIPHER_CTX_ctrl(
+                 self._ctx, self._backend._lib.EVP_CTRL_AEAD_GET_TAG,
+-                self._block_size_bytes, tag_buf
++                self._mode._min_tag_length, tag_buf
+             )
+             self._backend.openssl_assert(res != 0)
+             self._tag = self._backend._ffi.buffer(tag_buf)[:]
+diff --git a/hazmat/primitives/ciphers/modes.py b/hazmat/primitives/ciphers/modes.py
+index ad91a6e..3689f7c 100644
+--- a/hazmat/primitives/ciphers/modes.py
++++ b/hazmat/primitives/ciphers/modes.py
+@@ -216,3 +216,28 @@ class GCM(object):
+ 
+     def validate_for_algorithm(self, algorithm):
+         _check_aes_key_length(self, algorithm)
++
++
++@utils.register_interface(Mode)
++@utils.register_interface(ModeWithAuthenticationTag)
++class Poly1305(object):
++    name = "Poly1305"
++    _MAX_ENCRYPTED_BYTES = 2 ** 64
++    _MAX_AAD_BYTES = 2 ** 64
++    _TAG_LENGTH = 16
++
++    def __init__(self, tag=None):
++        if tag is not None:
++            utils._check_bytes("tag", tag)
++            if len(tag) != self._TAG_LENGTH:
++                raise ValueError(
++                    "Authentication tag must be {0} bytes.".format(
++                        self._TAG_LENGTH)
++                )
++        self._tag = tag
++        self._min_tag_length = self._TAG_LENGTH
++
++    tag = utils.read_only_property("_tag")
++
++    def validate_for_algorithm(self, algorithm):
++        _check_aes_key_length(self, algorithm)
